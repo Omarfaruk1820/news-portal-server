@@ -8,9 +8,9 @@ import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 
-// import newsRoutes from "./routes/newsRoutes.js";
-// import authRoutes from "./routes/authRoutes.js";
-// import categoryRoutes from "./routes/categoryRoutes.js";
+import newsRoutes from "./routes/newsRoutes.js";
+import authRoutes from "./routes/authRoutes.js";
+import categoryRoutes from "./routes/categoryRoutes.js";
 
 const app = express();
 
@@ -127,9 +127,9 @@ app.get("/api/health", (req, res) => {
 // 7. API routes
 // --------------------------------------------------
 
-// app.use("/api/news", newsRoutes);
-// app.use("/api/auth", authRoutes);
-// app.use("/api/categories", categoryRoutes);
+app.use("/api/news", newsRoutes);
+app.use("/api/auth", authRoutes);
+app.use("/api/categories", categoryRoutes);
 
 // --------------------------------------------------
 // 8. Not found handler
