@@ -1,6 +1,3 @@
-// index.js
-
-// Load environment variables from .env
 import "dotenv/config";
 
 import express from "express";
@@ -12,48 +9,55 @@ import newsRoutes from "./routes/newsRoutes.js";
 import authRoutes from "./routes/authRoutes.js";
 import categoryRoutes from "./routes/categoryRoutes.js";
 
+import { connectToMongoDB, disconnectFromMongoDB } from "./config/db.js";
+
 const app = express();
 
+const PORT = Number(process.env.PORT || 5000);
 const isProduction = process.env.NODE_ENV === "production";
-const PORT = process.env.PORT || 5000;
 
 // --------------------------------------------------
-// 1. CORS configuration
+// 1. Validate configuration
 // --------------------------------------------------
+
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+  throw new Error("PORT must be a valid port between 1 and 65535.");
+}
 
 const configuredOrigins = (process.env.CLIENT_URL || "")
   .split(",")
-  .map((origin) => origin.trim())
+  .map((origin) => origin.trim().replace(/\/+$/, ""))
   .filter(Boolean);
 
-const allowedOrigins = isProduction
-  ? configuredOrigins
-  : ["http://localhost:5173", "http://127.0.0.1:5173", ...configuredOrigins];
-
-if (isProduction && allowedOrigins.length === 0) {
+if (isProduction && configuredOrigins.length === 0) {
   throw new Error(
-    "CLIENT_URL must be configured with your frontend origin in production.",
+    "CLIENT_URL must contain your frontend origin in production.",
   );
 }
+
+const allowedOrigins = new Set([
+  ...(isProduction ? [] : ["http://localhost:5173", "http://127.0.0.1:5173"]),
+  ...configuredOrigins,
+]);
 
 // --------------------------------------------------
 // 2. Security middleware
 // --------------------------------------------------
 
+app.disable("x-powered-by");
 app.use(helmet());
 
 app.use(
   cors({
-    origin: (origin, callback) => {
-      // Allow requests without an Origin header, such as server-to-server calls.
-      if (!origin || allowedOrigins.includes(origin)) {
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.has(origin.replace(/\/+$/, ""))) {
         return callback(null, true);
       }
 
-      const corsError = new Error("Origin is not allowed by CORS.");
-      corsError.status = 403;
+      const error = new Error("Origin is not allowed by CORS.");
+      error.status = 403;
 
-      return callback(corsError);
+      return callback(error);
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -62,7 +66,7 @@ app.use(
 );
 
 // --------------------------------------------------
-// 3. Request body parsing
+// 3. Request parsing
 // --------------------------------------------------
 
 app.use(express.json({ limit: "1mb" }));
@@ -78,36 +82,38 @@ app.use(
 // 4. General API rate limiter
 // --------------------------------------------------
 
-const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 300,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    success: false,
-    message: "অনেক বেশি request করা হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।",
-  },
-});
-
-app.use("/api", apiLimiter);
+app.use(
+  "/api",
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 300,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+      success: false,
+      message: "অনেক বেশি request করা হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।",
+    },
+  }),
+);
 
 // --------------------------------------------------
 // 5. Authentication rate limiter
 // --------------------------------------------------
 
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    success: false,
-    message:
-      "অনেক বেশি authentication request করা হয়েছে। ১৫ মিনিট পরে আবার চেষ্টা করুন।",
-  },
-});
-
-app.use("/api/auth", authLimiter);
+app.use(
+  "/api/auth",
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+      success: false,
+      message:
+        "অনেক বেশি authentication request করা হয়েছে। পরে আবার চেষ্টা করুন।",
+    },
+  }),
+);
 
 // --------------------------------------------------
 // 6. Health check
@@ -133,7 +139,6 @@ app.use("/api/categories", categoryRoutes);
 
 // --------------------------------------------------
 // 8. Not found handler
-// Keep this after all routes.
 // --------------------------------------------------
 
 app.use((req, res) => {
@@ -147,7 +152,6 @@ app.use((req, res) => {
 
 // --------------------------------------------------
 // 9. Global error handler
-// Keep this as the final middleware.
 // --------------------------------------------------
 
 app.use((err, req, res, next) => {
@@ -155,13 +159,13 @@ app.use((err, req, res, next) => {
     return next(err);
   }
 
-  const statusCode = err.status || err.statusCode || 500;
-
-  // Avoid exposing internal error details in production.
-  const message =
-    statusCode >= 500 && isProduction
-      ? "Internal server error"
-      : err.message || "Something went wrong";
+  const candidateStatus = err.status ?? err.statusCode;
+  const statusCode =
+    Number.isInteger(candidateStatus) &&
+    candidateStatus >= 400 &&
+    candidateStatus <= 599
+      ? candidateStatus
+      : 500;
 
   if (statusCode >= 500) {
     console.error("Server error:", err);
@@ -169,15 +173,91 @@ app.use((err, req, res, next) => {
 
   res.status(statusCode).json({
     success: false,
-    message,
-    ...(isProduction ? {} : { stack: err.stack }),
+    message:
+      statusCode >= 500 && isProduction
+        ? "Internal server error"
+        : err.message || "Something went wrong",
+    ...(!isProduction ? { stack: err.stack } : {}),
   });
 });
 
 // --------------------------------------------------
-// 10. Start the server
+// 10. Start server only after MongoDB connects
 // --------------------------------------------------
 
-app.listen(PORT, () => {
-  console.log(`News portal server is running on port ${PORT}`);
+let server;
+let isShuttingDown = false;
+
+async function startServer() {
+  try {
+    await connectToMongoDB();
+
+    server = await new Promise((resolve, reject) => {
+      const httpServer = app.listen(PORT);
+
+      httpServer.once("listening", () => {
+        resolve(httpServer);
+      });
+
+      httpServer.once("error", reject);
+    });
+
+    console.log(`News portal server is running on port ${PORT}`);
+    console.log(`Health check: http://localhost:${PORT}/api/health`);
+
+    server.on("error", (error) => {
+      console.error("HTTP server error:", error);
+      process.exitCode = 1;
+    });
+  } catch (error) {
+    console.error("Server startup failed:", error.message);
+
+    try {
+      await disconnectFromMongoDB();
+    } catch (closeError) {
+      console.error("MongoDB cleanup failed:", closeError.message);
+    }
+
+    process.exitCode = 1;
+  }
+}
+
+// --------------------------------------------------
+// 11. Graceful shutdown
+// --------------------------------------------------
+
+async function shutdown(signal) {
+  if (isShuttingDown) {
+    return;
+  }
+
+  isShuttingDown = true;
+  console.log(`${signal} received. Shutting down...`);
+
+  try {
+    if (server) {
+      await new Promise((resolve, reject) => {
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+    }
+
+    await disconnectFromMongoDB();
+    console.log("Server shutdown completed.");
+  } catch (error) {
+    console.error("Shutdown failed:", error.message);
+    process.exitCode = 1;
+  }
+}
+
+process.once("SIGINT", () => {
+  void shutdown("SIGINT");
 });
+
+process.once("SIGTERM", () => {
+  void shutdown("SIGTERM");
+});
+
+void startServer();

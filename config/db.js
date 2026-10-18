@@ -1,57 +1,127 @@
-// config/db.js
-
 import "dotenv/config";
 import { MongoClient } from "mongodb";
 
-const mongoUri = process.env.MONGODB_URI;
-const databaseName = process.env.DB_NAME;
+// --------------------------------------------------
+// 1. MongoDB configuration
+// --------------------------------------------------
 
-if (!mongoUri) {
-  throw new Error("MONGODB_URI is missing from your .env file.");
+// Atlas cluster hostname: এখানে শুধু hostname লিখবেন।
+// আপনার Atlas cluster-এর hostname আলাদা হলে সেটি বসান।
+const clusterHost = "cluster0.g29mryf.mongodb.net";
+
+const dbUser = process.env.DB_USER?.trim();
+const dbPass = process.env.DB_PASS;
+const databaseName = process.env.DB_NAME?.trim();
+
+if (!dbUser || !dbPass || !databaseName) {
+  throw new Error(
+    "DB_USER, DB_PASS, and DB_NAME must be configured in the backend .env file.",
+  );
 }
 
-if (!databaseName) {
-  throw new Error("DB_NAME is missing from your .env file.");
-}
+const mongoUri =
+  `mongodb+srv://${encodeURIComponent(dbUser)}:` +
+  `${encodeURIComponent(dbPass)}@${clusterHost}/` +
+  `?retryWrites=true&w=majority`;
 
-const client = new MongoClient(mongoUri);
+// --------------------------------------------------
+// 2. MongoDB client
+// --------------------------------------------------
 
-let database;
+const client = new MongoClient(mongoUri, {
+  connectTimeoutMS: 10000,
+  serverSelectionTimeoutMS: 10000,
+  maxPoolSize: 20,
+});
 
-// Connect to MongoDB once during application startup.
+let database = null;
+let connectionPromise = null;
+let isClosing = false;
+
+// --------------------------------------------------
+// 3. Connect and reuse the database
+// --------------------------------------------------
+
 export async function connectToMongoDB() {
-  try {
-    await client.connect();
-
-    database = client.db(databaseName);
-
-    // Verify the connection with a ping.
-    await database.command({ ping: 1 });
-
-    console.log("MongoDB connected successfully.");
-
-    return database;
-  } catch (error) {
-    console.error("MongoDB connection failed:", error.message);
-    throw error;
+  if (isClosing) {
+    throw new Error("MongoDB client is shutting down.");
   }
+
+  if (database) {
+    return database;
+  }
+
+  // Prevent simultaneous duplicate connection attempts.
+  if (connectionPromise) {
+    return connectionPromise;
+  }
+
+  connectionPromise = (async () => {
+    try {
+      await client.connect();
+
+      const db = client.db(databaseName);
+
+      // Confirm that the database connection is working.
+      await db.command({ ping: 1 });
+
+      database = db;
+
+      console.log(`MongoDB connected. Database: ${databaseName}`);
+
+      return database;
+    } catch (error) {
+      console.error("MongoDB connection failed:", error.message);
+      throw error;
+    } finally {
+      connectionPromise = null;
+    }
+  })();
+
+  return connectionPromise;
 }
 
-// Return the connected database to routes and other modules.
+// --------------------------------------------------
+// 4. Get the connected database
+// --------------------------------------------------
+
 export function getDB() {
-  if (!database) {
+  if (!database || isClosing) {
     throw new Error(
-      "Database is not connected. Call connectToMongoDB() before using getDB().",
+      "MongoDB is not connected. Call connectToMongoDB() before getDB().",
     );
   }
 
   return database;
 }
 
-// Close MongoDB connection when shutting down.
-export async function disconnectFromMongoDB() {
-  await client.close();
-  database = undefined;
+// --------------------------------------------------
+// 5. Graceful shutdown
+// --------------------------------------------------
 
-  console.log("MongoDB connection closed.");
+export async function disconnectFromMongoDB() {
+  if (isClosing) {
+    return;
+  }
+
+  isClosing = true;
+
+  try {
+    // Wait for an in-progress connection attempt to finish.
+    if (connectionPromise) {
+      try {
+        await connectionPromise;
+      } catch {
+        // The connection error was already logged.
+      }
+    }
+
+    await client.close();
+    database = null;
+
+    console.log("MongoDB connection closed.");
+  } finally {
+    database = null;
+    connectionPromise = null;
+  }
 }
