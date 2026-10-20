@@ -9,8 +9,12 @@ const router = express.Router();
 const NEWS_COLLECTION = "news";
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 50;
+const MAX_PAGE = 1000000;
+const MAX_SEARCH_LENGTH = 100;
+const MAX_IDENTIFIER_LENGTH = 200;
 
 const PUBLIC_NEWS_PROJECTION = {
+  _id: 1,
   title: 1,
   slug: 1,
   category: 1,
@@ -21,6 +25,8 @@ const PUBLIC_NEWS_PROJECTION = {
   publishedAt: 1,
   createdAt: 1,
   featured: 1,
+  views: 1,
+  trendingScore: 1,
 };
 
 const ARTICLE_PROJECTION = {
@@ -30,7 +36,15 @@ const ARTICLE_PROJECTION = {
   updatedAt: 1,
 };
 
-const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const getNewsCollection = () => getDB().collection(NEWS_COLLECTION);
+
+const publishedFilter = () => ({
+  status: "published",
+});
+
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 function parsePagination(query, defaultLimit = DEFAULT_LIMIT) {
   const rawPage = query.page ?? "1";
@@ -51,7 +65,7 @@ function parsePagination(query, defaultLimit = DEFAULT_LIMIT) {
   if (
     !Number.isSafeInteger(page) ||
     page < 1 ||
-    page > 1000000 ||
+    page > MAX_PAGE ||
     !Number.isSafeInteger(limit) ||
     limit < 1 ||
     limit > MAX_LIMIT
@@ -68,12 +82,6 @@ function parsePagination(query, defaultLimit = DEFAULT_LIMIT) {
   return { page, limit, skip };
 }
 
-const publishedFilter = () => ({
-  status: "published",
-});
-
-const getNewsCollection = () => getDB().collection(NEWS_COLLECTION);
-
 function sendPaginatedNews(res, { page, limit, total, news }) {
   return res.status(200).json({
     success: true,
@@ -89,7 +97,34 @@ function sendPaginatedNews(res, { page, limit, total, news }) {
   });
 }
 
+function resolveCategoryFilter(categoryInput) {
+  if (
+    typeof categoryInput !== "string" ||
+    !categoryInput.trim() ||
+    categoryInput.trim().length > 100
+  ) {
+    return null;
+  }
+
+  const categoryName = resolveCategoryName(categoryInput.trim());
+
+  if (!categoryName || typeof categoryName !== "string") {
+    return null;
+  }
+
+  return {
+    $regex: `^\\s*${escapeRegex(categoryName.trim())}\\s*$`,
+    $options: "i",
+  };
+}
+
+function buildPublishedDate(article) {
+  return article.publishedAt || article.createdAt || null;
+}
+
 // GET /api/news
+// GET /api/news?category=education
+// GET /api/news?category=শিক্ষা&page=1&limit=10
 router.get("/", async (req, res, next) => {
   try {
     const pagination = parsePagination(req.query);
@@ -97,33 +132,23 @@ router.get("/", async (req, res, next) => {
     if (!pagination) {
       return res.status(400).json({
         success: false,
-        message: `Page must be between 1 and 1000000; limit must be between 1 and ${MAX_LIMIT}.`,
+        message: `Invalid pagination. Page must be 1-${MAX_PAGE} and limit must be 1-${MAX_LIMIT}.`,
       });
     }
 
     const filter = publishedFilter();
 
     if (req.query.category !== undefined) {
-      if (typeof req.query.category !== "string") {
+      const categoryFilter = resolveCategoryFilter(req.query.category);
+
+      if (!categoryFilter) {
         return res.status(400).json({
           success: false,
-          message: "Category must be a single string.",
+          message: "A valid category name or slug is required.",
         });
       }
 
-      const category = resolveCategoryName(req.query.category);
-
-      if (!category) {
-        return res.status(400).json({
-          success: false,
-          message: "A valid category is required.",
-        });
-      }
-
-      filter.category = {
-        $regex: `^\\s*${escapeRegex(category)}\\s*$`,
-        $options: "i",
-      };
+      filter.category = categoryFilter;
     }
 
     const collection = getNewsCollection();
@@ -137,19 +162,28 @@ router.get("/", async (req, res, next) => {
         .skip(skip)
         .limit(limit)
         .toArray(),
+
       collection.countDocuments(filter),
     ]);
 
-    return sendPaginatedNews(res, { page, limit, total, news });
+    return sendPaginatedNews(res, {
+      page,
+      limit,
+      total,
+      news,
+    });
   } catch (error) {
     return next(error);
   }
 });
 
-// GET /api/news/latest
+// GET /api/news/latest?limit=10
 router.get("/latest", async (req, res, next) => {
   try {
-    const pagination = parsePagination({ limit: req.query.limit }, 10);
+    const pagination = parsePagination(
+      { limit: req.query.limit },
+      DEFAULT_LIMIT,
+    );
 
     if (!pagination) {
       return res.status(400).json({
@@ -175,7 +209,7 @@ router.get("/latest", async (req, res, next) => {
   }
 });
 
-// GET /api/news/featured
+// GET /api/news/featured?limit=5
 router.get("/featured", async (req, res, next) => {
   try {
     const pagination = parsePagination({ limit: req.query.limit }, 5);
@@ -207,10 +241,13 @@ router.get("/featured", async (req, res, next) => {
   }
 });
 
-// GET /api/news/popular
+// GET /api/news/popular?limit=10
 router.get("/popular", async (req, res, next) => {
   try {
-    const pagination = parsePagination({ limit: req.query.limit }, 10);
+    const pagination = parsePagination(
+      { limit: req.query.limit },
+      DEFAULT_LIMIT,
+    );
 
     if (!pagination) {
       return res.status(400).json({
@@ -222,7 +259,11 @@ router.get("/popular", async (req, res, next) => {
     const news = await getNewsCollection()
       .find(publishedFilter())
       .project(PUBLIC_NEWS_PROJECTION)
-      .sort({ views: -1, publishedAt: -1, _id: -1 })
+      .sort({
+        views: -1,
+        publishedAt: -1,
+        _id: -1,
+      })
       .limit(pagination.limit)
       .toArray();
 
@@ -236,10 +277,13 @@ router.get("/popular", async (req, res, next) => {
   }
 });
 
-// GET /api/news/trending
+// GET /api/news/trending?limit=10
 router.get("/trending", async (req, res, next) => {
   try {
-    const pagination = parsePagination({ limit: req.query.limit }, 10);
+    const pagination = parsePagination(
+      { limit: req.query.limit },
+      DEFAULT_LIMIT,
+    );
 
     if (!pagination) {
       return res.status(400).json({
@@ -251,7 +295,11 @@ router.get("/trending", async (req, res, next) => {
     const news = await getNewsCollection()
       .find(publishedFilter())
       .project(PUBLIC_NEWS_PROJECTION)
-      .sort({ trendingScore: -1, publishedAt: -1, _id: -1 })
+      .sort({
+        trendingScore: -1,
+        publishedAt: -1,
+        _id: -1,
+      })
       .limit(pagination.limit)
       .toArray();
 
@@ -265,16 +313,16 @@ router.get("/trending", async (req, res, next) => {
   }
 });
 
-// GET /api/news/search?q=technology
+// GET /api/news/search?q=technology&page=1&limit=10
 router.get("/search", async (req, res, next) => {
   try {
     const searchTerm =
       typeof req.query.q === "string" ? req.query.q.trim() : "";
 
-    if (!searchTerm || searchTerm.length > 100) {
+    if (!searchTerm || searchTerm.length > MAX_SEARCH_LENGTH) {
       return res.status(400).json({
         success: false,
-        message: "Search query is required and must not exceed 100 characters.",
+        message: `Search query is required and must not exceed ${MAX_SEARCH_LENGTH} characters.`,
       });
     }
 
@@ -299,6 +347,7 @@ router.get("/search", async (req, res, next) => {
         { excerpt: searchRegex },
         { content: searchRegex },
         { tags: searchRegex },
+        { category: searchRegex },
       ],
     };
 
@@ -313,25 +362,34 @@ router.get("/search", async (req, res, next) => {
         .skip(skip)
         .limit(limit)
         .toArray(),
+
       collection.countDocuments(filter),
     ]);
 
-    return sendPaginatedNews(res, { page, limit, total, news });
+    return sendPaginatedNews(res, {
+      page,
+      limit,
+      total,
+      news,
+    });
   } catch (error) {
     return next(error);
   }
 });
 
 // GET /api/news/:identifier
-// Keep this route after all named routes above.
+// identifier may be a slug or MongoDB ObjectId.
 router.get("/:identifier", async (req, res, next) => {
   try {
-    const identifier = req.params.identifier.trim();
+    const identifier =
+      typeof req.params.identifier === "string"
+        ? req.params.identifier.trim()
+        : "";
 
-    if (!identifier || identifier.length > 200) {
+    if (!identifier || identifier.length > MAX_IDENTIFIER_LENGTH) {
       return res.status(400).json({
         success: false,
-        message: "A valid news identifier is required.",
+        message: "A valid news slug or identifier is required.",
       });
     }
 
@@ -361,7 +419,7 @@ router.get("/:identifier", async (req, res, next) => {
       success: true,
       data: {
         ...article,
-        publishedAt: article.publishedAt || article.createdAt || null,
+        publishedAt: buildPublishedDate(article),
       },
     });
   } catch (error) {
