@@ -11,42 +11,46 @@ import categoryRoutes from "./routes/categoryRoutes.js";
 
 import { connectToMongoDB, disconnectFromMongoDB, getDB } from "./config/db.js";
 
+import { ensureIndexes } from "./config/indexes.js";
+
 const app = express();
 
 const PORT = Number(process.env.PORT || 5000);
 const isProduction = process.env.NODE_ENV === "production";
 
-// --------------------------------------------------
-// 1. Validate server configuration
-// --------------------------------------------------
-
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
-  throw new Error("PORT must be a valid port between 1 and 65535.");
+  throw new Error("PORT must be between 1 and 65535.");
 }
 
+if (
+  !process.env.JWT_SECRET ||
+  Buffer.byteLength(process.env.JWT_SECRET, "utf8") < 32
+) {
+  throw new Error("JWT_SECRET must contain at least 32 bytes.");
+}
+
+// Validate frontend origins.
 function normalizeOrigin(value) {
-  let parsedUrl;
+  let parsed;
 
   try {
-    parsedUrl = new URL(value);
+    parsed = new URL(value);
   } catch {
     throw new Error(`Invalid CLIENT_URL origin: ${value}`);
   }
 
   if (
-    !["http:", "https:"].includes(parsedUrl.protocol) ||
-    parsedUrl.username ||
-    parsedUrl.password ||
-    parsedUrl.pathname !== "/" ||
-    parsedUrl.search ||
-    parsedUrl.hash
+    !["http:", "https:"].includes(parsed.protocol) ||
+    parsed.username ||
+    parsed.password ||
+    parsed.pathname !== "/" ||
+    parsed.search ||
+    parsed.hash
   ) {
-    throw new Error(
-      `CLIENT_URL must contain only an origin, such as https://example.com. Invalid value: ${value}`,
-    );
+    throw new Error(`CLIENT_URL must contain only an origin: ${value}`);
   }
 
-  return parsedUrl.origin;
+  return parsed.origin;
 }
 
 const configuredOrigins = (process.env.CLIENT_URL || "")
@@ -56,19 +60,13 @@ const configuredOrigins = (process.env.CLIENT_URL || "")
   .map(normalizeOrigin);
 
 if (isProduction && configuredOrigins.length === 0) {
-  throw new Error(
-    "CLIENT_URL must contain at least one frontend origin in production.",
-  );
+  throw new Error("Set CLIENT_URL to your production frontend origin.");
 }
 
 const allowedOrigins = new Set([
   ...(isProduction ? [] : ["http://localhost:5173", "http://127.0.0.1:5173"]),
   ...configuredOrigins,
 ]);
-
-// --------------------------------------------------
-// 2. Security middleware
-// --------------------------------------------------
 
 app.disable("x-powered-by");
 
@@ -77,8 +75,7 @@ app.use(helmet());
 app.use(
   cors({
     origin(origin, callback) {
-      // Requests without an Origin header include server-to-server
-      // and command-line requests. CORS does not authenticate them.
+      // CORS is not authentication. Requests without Origin are allowed.
       if (!origin) {
         return callback(null, true);
       }
@@ -93,14 +90,13 @@ app.use(
         return callback(error);
       }
 
-      if (allowedOrigins.has(normalizedOrigin)) {
-        return callback(null, true);
+      if (!allowedOrigins.has(normalizedOrigin)) {
+        const error = new Error("Origin is not allowed by CORS.");
+        error.status = 403;
+        return callback(error);
       }
 
-      const error = new Error("Origin is not allowed by CORS.");
-      error.status = 403;
-
-      return callback(error);
+      return callback(null, true);
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -108,22 +104,15 @@ app.use(
   }),
 );
 
-// --------------------------------------------------
-// 3. General API rate limiter
-// --------------------------------------------------
-
+// General API limiter. Auth receives its own limiter.
 const apiRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 300,
   standardHeaders: "draft-8",
   legacyHeaders: false,
-
-  // Auth has its own stricter limiter below.
   skip(req) {
-    const path = req.originalUrl.split("?")[0];
-    return path === "/api/auth" || path.startsWith("/api/auth/");
+    return req.path === "/auth" || req.path.startsWith("/auth/");
   },
-
   message: {
     success: false,
     message: "অনেক বেশি request করা হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।",
@@ -131,10 +120,6 @@ const apiRateLimiter = rateLimit({
 });
 
 app.use("/api", apiRateLimiter);
-
-// --------------------------------------------------
-// 4. Authentication rate limiter
-// --------------------------------------------------
 
 app.use(
   "/api/auth",
@@ -151,10 +136,6 @@ app.use(
   }),
 );
 
-// --------------------------------------------------
-// 5. Request parsing
-// --------------------------------------------------
-
 app.use(express.json({ limit: "1mb" }));
 
 app.use(
@@ -164,13 +145,8 @@ app.use(
   }),
 );
 
-// --------------------------------------------------
-// 6. Health / readiness check
-// --------------------------------------------------
-
-// This endpoint verifies that the API can reach MongoDB.
-// Returns 503 if the database is not ready.
-app.get("/api/health", async (req, res) => {
+// Health/readiness check
+app.get("/api/health", async (req, res, next) => {
   try {
     await getDB().command({ ping: 1 });
 
@@ -180,28 +156,16 @@ app.get("/api/health", async (req, res) => {
       database: "connected",
     });
   } catch (error) {
-    console.error("Health check failed:", error.message);
-
-    return res.status(503).json({
-      success: false,
-      status: "unavailable",
-      database: "disconnected",
-    });
+    return next(error);
   }
 });
 
-// --------------------------------------------------
-// 7. API routes
-// --------------------------------------------------
-
+// API routes
 app.use("/api/news", newsRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/categories", categoryRoutes);
 
-// --------------------------------------------------
-// 8. Not found handler
-// --------------------------------------------------
-
+// Unknown routes
 app.use((req, res) => {
   return res.status(404).json({
     success: false,
@@ -211,10 +175,7 @@ app.use((req, res) => {
   });
 });
 
-// --------------------------------------------------
-// 9. Global error handler
-// --------------------------------------------------
-
+// Global error handler
 app.use((err, req, res, next) => {
   if (res.headersSent) {
     return next(err);
@@ -222,21 +183,30 @@ app.use((err, req, res, next) => {
 
   const candidateStatus = err.status ?? err.statusCode;
 
-  const statusCode =
+  let statusCode =
     Number.isInteger(candidateStatus) &&
     candidateStatus >= 400 &&
     candidateStatus <= 599
       ? candidateStatus
       : 500;
 
+  // Malformed JSON from express.json()
+  if (err instanceof SyntaxError && "body" in err) {
+    statusCode = 400;
+  }
+
   if (statusCode >= 500) {
     console.error("Server error:", err);
+  } else if (!isProduction) {
+    console.warn("Request error:", err.message);
   }
 
   const message =
     statusCode >= 500 && isProduction
       ? "Internal server error."
-      : err.message || "Something went wrong.";
+      : statusCode === 400 && err instanceof SyntaxError
+        ? "Invalid JSON request body."
+        : err.message || "Something went wrong.";
 
   return res.status(statusCode).json({
     success: false,
@@ -245,16 +215,13 @@ app.use((err, req, res, next) => {
   });
 });
 
-// --------------------------------------------------
-// 10. Start server after MongoDB connects
-// --------------------------------------------------
-
 let server;
 let isShuttingDown = false;
 
 async function startServer() {
   try {
     await connectToMongoDB();
+    await ensureIndexes();
 
     server = app.listen(PORT);
 
@@ -278,13 +245,12 @@ async function startServer() {
       server.once("error", onError);
     });
 
-    // Handle HTTP server errors occurring after startup.
     server.on("error", (error) => {
       console.error("HTTP server error:", error);
       process.exitCode = 1;
     });
 
-    console.log(`News portal server is running on port ${PORT}`);
+    console.log(`News portal API running on port ${PORT}`);
     console.log(`Health check: http://localhost:${PORT}/api/health`);
   } catch (error) {
     console.error("Server startup failed:", error.message);
@@ -299,35 +265,26 @@ async function startServer() {
   }
 }
 
-// --------------------------------------------------
-// 11. Graceful shutdown
-// --------------------------------------------------
-
 async function shutdown(signal) {
   if (isShuttingDown) {
-    console.warn("Shutdown already in progress.");
-
-    // A repeated signal means force-close active HTTP connections.
     server?.closeAllConnections();
-
     return;
   }
 
   isShuttingDown = true;
 
-  console.log(`${signal} received. Shutting down gracefully...`);
+  console.log(`${signal} received. Shutting down...`);
 
-  // Avoid waiting forever for stuck requests.
   const forceShutdownTimer = setTimeout(() => {
-    console.error("Shutdown timed out. Closing remaining connections.");
-
+    console.error("Shutdown timed out. Closing open connections.");
     server?.closeAllConnections();
     process.exit(1);
   }, 15000);
 
+  forceShutdownTimer.unref();
+
   try {
     if (server) {
-      // Stop accepting new connections and wait for active requests.
       await new Promise((resolve, reject) => {
         server.close((error) => {
           if (error) reject(error);
@@ -339,11 +296,9 @@ async function shutdown(signal) {
     await disconnectFromMongoDB();
 
     clearTimeout(forceShutdownTimer);
-
     console.log("Server shutdown completed.");
   } catch (error) {
     clearTimeout(forceShutdownTimer);
-
     console.error("Shutdown failed:", error.message);
     process.exitCode = 1;
   }

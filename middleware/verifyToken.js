@@ -1,21 +1,14 @@
 
 import jwt from "jsonwebtoken";
+import { ObjectId } from "mongodb";
 
-const verifyToken = (req, res, next) => {
-  const secret = process.env.JWT_SECRET;
-
-  if (!secret || secret === "REPLACE_WITH_A_LONG_RANDOM_SECRET") {
-    console.error("JWT_SECRET is missing or not configured.");
-
-    return res.status(500).json({
-      success: false,
-      message: "Authentication service is not configured.",
-    });
-  }
-
+export default function verifyToken(req, res, next) {
   const authorization = req.headers.authorization;
 
-  if (!authorization || !authorization.startsWith("Bearer ")) {
+  if (
+    typeof authorization !== "string" ||
+    !authorization.startsWith("Bearer ")
+  ) {
     return res.status(401).json({
       success: false,
       message: "Authentication token is required.",
@@ -24,49 +17,40 @@ const verifyToken = (req, res, next) => {
 
   const token = authorization.slice(7).trim();
 
-  if (!token) {
+  if (!token || !process.env.JWT_SECRET) {
     return res.status(401).json({
       success: false,
-      message: "Authentication token is required.",
+      message: "Invalid authentication credentials.",
     });
   }
 
   try {
-    const decoded = jwt.verify(token, secret, {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, {
       algorithms: ["HS256"],
     });
 
-    if (!decoded || typeof decoded !== "object" || !decoded.sub && !decoded.userId && !decoded.id && !decoded.email) {
+    if (
+      typeof decoded !== "object" ||
+      typeof decoded.sub !== "string" ||
+      !ObjectId.isValid(decoded.sub) ||
+      String(new ObjectId(decoded.sub)) !== decoded.sub
+    ) {
       return res.status(401).json({
         success: false,
         message: "Invalid authentication token.",
       });
     }
 
-    // Make the verified token payload available to subsequent middleware.
-    req.user = decoded;
+    req.user = {
+      id: decoded.sub,
+      tokenRole: decoded.role,
+    };
 
     return next();
-  } catch (error) {
-    if (error.name === "TokenExpiredError") {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication token has expired.",
-      });
-    }
-
-    if (error.name === "JsonWebTokenError") {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid authentication token.",
-      });
-    }
-
+  } catch {
     return res.status(401).json({
       success: false,
-      message: "Authentication failed.",
+      message: "Invalid or expired authentication token.",
     });
   }
-};
-
-export default verifyToken;
+}

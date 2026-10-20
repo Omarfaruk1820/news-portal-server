@@ -1,55 +1,58 @@
 import express from "express";
+
 import { getDB } from "../config/db.js";
+import {
+  CATEGORY_SLUGS,
+  resolveCategoryName,
+  getCategorySlug,
+} from "../config/categories.js";
 
 const router = express.Router();
 
-const NEWS_COLLECTION = "news";
-const DEFAULT_LIMIT = 10;
+const DEFAULT_LIMIT = 12;
 const MAX_LIMIT = 50;
+const MAX_PAGE = 1000000;
 
-const CATEGORY_NEWS_PROJECTION = {
+const PUBLIC_NEWS_PROJECTION = {
+  _id: 1,
   title: 1,
   slug: 1,
   category: 1,
   excerpt: 1,
   image: 1,
   author: 1,
+  tags: 1,
   publishedAt: 1,
   createdAt: 1,
+  featured: 1,
 };
 
-const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function parsePositiveInteger(value, fallback, maximum) {
+  if (value === undefined || value === "") {
+    return fallback;
+  }
 
-const parsePagination = (query) => {
-  const page = Number(query.page ?? 1);
-  const limit = Number(query.limit ?? DEFAULT_LIMIT);
-
-  if (
-    !Number.isSafeInteger(page) ||
-    page < 1 ||
-    !Number.isSafeInteger(limit) ||
-    limit < 1 ||
-    limit > MAX_LIMIT
-  ) {
+  if (typeof value !== "string" || !/^\d+$/.test(value)) {
     return null;
   }
 
-  const skip = (page - 1) * limit;
+  const parsed = Number(value);
 
-  if (!Number.isSafeInteger(skip)) {
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) {
     return null;
   }
 
-  return { page, limit, skip };
-};
+  return parsed;
+}
 
-const getNewsCollection = () => getDB().collection(NEWS_COLLECTION);
+function getPublishedNewsCollection() {
+  return getDB().collection("news");
+}
 
 // GET /api/categories
-// Derive categories and counts from published news documents.
 router.get("/", async (req, res, next) => {
   try {
-    const categories = await getNewsCollection()
+    const rows = await getPublishedNewsCollection()
       .aggregate([
         {
           $match: {
@@ -61,105 +64,143 @@ router.get("/", async (req, res, next) => {
           },
         },
         {
-          $group: {
-            _id: {
-              $trim: {
-                input: "$category",
-              },
-            },
-            newsCount: {
-              $sum: 1,
+          $project: {
+            category: {
+              $trim: { input: "$category" },
             },
           },
         },
         {
           $match: {
-            _id: {
-              $ne: "",
-            },
+            category: { $ne: "" },
           },
+        },
+        {
+          $group: {
+            _id: { $toLower: "$category" },
+            name: { $first: "$category" },
+            articleCount: { $sum: 1 },
+          },
+        },
+        {
+          $sort: { name: 1 },
         },
         {
           $project: {
             _id: 0,
-            name: "$_id",
-            newsCount: 1,
-          },
-        },
-        {
-          $sort: {
             name: 1,
+            articleCount: 1,
           },
         },
       ])
       .toArray();
 
+    const data = rows.map((item) => ({
+      ...item,
+      slug: getCategorySlug(item.name),
+    }));
+
+    // Include configured categories with zero articles if useful to the UI.
+    // Existing categories from MongoDB retain their actual article counts.
+    const existingSlugs = new Set(data.map((item) => item.slug));
+
+    for (const [slug, name] of Object.entries(CATEGORY_SLUGS)) {
+      if (!existingSlugs.has(slug)) {
+        data.push({
+          name,
+          slug,
+          articleCount: 0,
+        });
+      }
+    }
+
+    data.sort((a, b) => a.name.localeCompare(b.name, "bn"));
+
     return res.status(200).json({
       success: true,
-      count: categories.length,
-      data: categories,
+      count: data.length,
+      data,
     });
   } catch (error) {
     return next(error);
   }
 });
 
-// GET /api/categories/:category?page=1&limit=10
+// GET /api/categories/national?page=1&limit=12
+// Also accepts Bengali category names, e.g. /api/categories/জাতীয়
 router.get("/:category", async (req, res, next) => {
   try {
-    const category = req.params.category.trim();
+    const categoryName = resolveCategoryName(req.params.category);
 
-    if (!category || category.length > 80) {
+    if (!categoryName) {
       return res.status(400).json({
         success: false,
-        message: "Invalid category name.",
+        message: "A valid category is required.",
       });
     }
 
-    const pagination = parsePagination(req.query);
+    const page = parsePositiveInteger(req.query.page, 1, MAX_PAGE);
 
-    if (!pagination) {
+    const limit = parsePositiveInteger(
+      req.query.limit,
+      DEFAULT_LIMIT,
+      MAX_LIMIT,
+    );
+
+    if (page === null || limit === null) {
       return res.status(400).json({
         success: false,
-        message: `Page must be positive. Limit must be between 1 and ${MAX_LIMIT}.`,
+        message: `Page must be between 1 and ${MAX_PAGE}; limit must be between 1 and ${MAX_LIMIT}.`,
       });
     }
+
+    const skip = (page - 1) * limit;
+
+    if (!Number.isSafeInteger(skip)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid pagination parameters.",
+      });
+    }
+
+    const categoryPattern = new RegExp(
+      `^\\s*${categoryName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`,
+      "i",
+    );
 
     const filter = {
       status: "published",
-      category: {
-        $regex: `^${escapeRegex(category)}$`,
-        $options: "i",
-      },
+      category: categoryPattern,
     };
 
-    const collection = getNewsCollection();
-    const { page, limit, skip } = pagination;
+    const collection = getPublishedNewsCollection();
 
-    const [news, total] = await Promise.all([
+    const [articles, totalArticles] = await Promise.all([
       collection
         .find(filter)
-        .project(CATEGORY_NEWS_PROJECTION)
+        .project(PUBLIC_NEWS_PROJECTION)
         .sort({ publishedAt: -1, _id: -1 })
         .skip(skip)
         .limit(limit)
         .toArray(),
-
       collection.countDocuments(filter),
     ]);
 
+    const totalPages = Math.ceil(totalArticles / limit);
+
     return res.status(200).json({
       success: true,
-      category,
+      category: categoryName,
+      count: articles.length,
       pagination: {
         page,
         limit,
-        total,
-        totalPages: Math.ceil(total / limit),
-        hasNextPage: page * limit < total,
+        totalArticles,
+        totalPages,
+        hasNextPage: page < totalPages,
         hasPreviousPage: page > 1,
       },
-      data: news,
+      data: articles,
     });
   } catch (error) {
     return next(error);

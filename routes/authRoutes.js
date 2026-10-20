@@ -1,23 +1,21 @@
-// routes/authRoutes.js
-
 import express from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { ObjectId } from "mongodb";
 
 import { getDB } from "../config/db.js";
+import verifyToken from "../middleware/verifyToken.js";
 
 const router = express.Router();
 
 const USERS_COLLECTION = "users";
 const JWT_EXPIRES_IN = "1d";
 
-// --------------------------------------------------
-// Helpers
-// --------------------------------------------------
+function createToken(user) {
+  const secret = process.env.JWT_SECRET;
 
-const createToken = (user) => {
-  if (!process.env.JWT_SECRET) {
-    throw new Error("JWT_SECRET is not configured.");
+  if (!secret || Buffer.byteLength(secret, "utf8") < 32) {
+    throw new Error("JWT_SECRET must contain at least 32 bytes.");
   }
 
   return jwt.sign(
@@ -25,22 +23,28 @@ const createToken = (user) => {
       sub: user._id.toString(),
       role: user.role,
     },
-    process.env.JWT_SECRET,
-    { expiresIn: JWT_EXPIRES_IN },
+    secret,
+    {
+      algorithm: "HS256",
+      expiresIn: JWT_EXPIRES_IN,
+    },
   );
-};
+}
 
-const publicUser = (user) => ({
-  id: user._id.toString(),
-  name: user.name,
-  email: user.email,
-  role: user.role,
-});
+function publicUser(user) {
+  return {
+    id: user._id.toString(),
+    name: user.name,
+    email: user.email,
+    role: user.role,
+  };
+}
 
-// --------------------------------------------------
+function isValidEmail(email) {
+  return email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
 // POST /api/auth/register
-// --------------------------------------------------
-
 router.post("/register", async (req, res, next) => {
   try {
     const { name, email, password } = req.body || {};
@@ -66,8 +70,7 @@ router.post("/register", async (req, res, next) => {
       });
     }
 
-    // Basic email format check
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    if (!isValidEmail(normalizedEmail)) {
       return res.status(400).json({
         success: false,
         message: "Please provide a valid email address.",
@@ -81,8 +84,7 @@ router.post("/register", async (req, res, next) => {
       });
     }
 
-    const db = getDB();
-    const users = db.collection(USERS_COLLECTION);
+    const users = getDB().collection(USERS_COLLECTION);
 
     const existingUser = await users.findOne({
       email: normalizedEmail,
@@ -96,14 +98,15 @@ router.post("/register", async (req, res, next) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
+    const now = new Date();
 
     const newUser = {
       name: normalizedName,
       email: normalizedEmail,
       password: passwordHash,
       role: "user",
-      createdAt: new Date(),
-      updatedAt: new Date(),
+      createdAt: now,
+      updatedAt: now,
     };
 
     const result = await users.insertOne(newUser);
@@ -113,16 +116,13 @@ router.post("/register", async (req, res, next) => {
       _id: result.insertedId,
     };
 
-    const token = createToken(createdUser);
-
     return res.status(201).json({
       success: true,
       message: "Registration successful.",
-      token,
+      token: createToken(createdUser),
       user: publicUser(createdUser),
     });
   } catch (error) {
-    // Handles duplicate-email races if a unique index exists.
     if (error?.code === 11000) {
       return res.status(409).json({
         success: false,
@@ -134,10 +134,7 @@ router.post("/register", async (req, res, next) => {
   }
 });
 
-// --------------------------------------------------
 // POST /api/auth/login
-// --------------------------------------------------
-
 router.post("/login", async (req, res, next) => {
   try {
     const { email, password } = req.body || {};
@@ -146,37 +143,43 @@ router.post("/login", async (req, res, next) => {
       typeof email !== "string" ||
       typeof password !== "string" ||
       !email.trim() ||
-      !password
+      !password ||
+      password.length > 128
     ) {
       return res.status(400).json({
         success: false,
-        message: "Email and password are required.",
+        message: "A valid email and password are required.",
       });
     }
 
     const normalizedEmail = email.trim().toLowerCase();
 
-    const db = getDB();
-    const users = db.collection(USERS_COLLECTION);
+    if (!isValidEmail(normalizedEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a valid email address.",
+      });
+    }
 
-    const user = await users.findOne({
-      email: normalizedEmail,
-    });
+    const user = await getDB()
+      .collection(USERS_COLLECTION)
+      .findOne({ email: normalizedEmail });
 
-    // Use the same message for unknown email and wrong password.
-    if (!user || !(await bcrypt.compare(password, user.password))) {
+    if (
+      !user ||
+      typeof user.password !== "string" ||
+      !(await bcrypt.compare(password, user.password))
+    ) {
       return res.status(401).json({
         success: false,
         message: "Invalid email or password.",
       });
     }
 
-    const token = createToken(user);
-
     return res.status(200).json({
       success: true,
       message: "Login successful.",
-      token,
+      token: createToken(user),
       user: publicUser(user),
     });
   } catch (error) {
@@ -184,43 +187,22 @@ router.post("/login", async (req, res, next) => {
   }
 });
 
-// --------------------------------------------------
 // GET /api/auth/me
-// Requires: Authorization: Bearer <token>
-// --------------------------------------------------
-
-router.get("/me", async (req, res, next) => {
+router.get("/me", verifyToken, async (req, res, next) => {
   try {
-    const authHeader = req.headers.authorization;
-
-    if (!authHeader?.startsWith("Bearer ")) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication token is required.",
-      });
-    }
-
-    const token = authHeader.slice(7);
-
-    if (!process.env.JWT_SECRET) {
-      throw new Error("JWT_SECRET is not configured.");
-    }
-
-    let decoded;
-
-    try {
-      decoded = jwt.verify(token, process.env.JWT_SECRET);
-    } catch {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid or expired authentication token.",
-      });
-    }
-
-    const db = getDB();
-    const user = await db.collection(USERS_COLLECTION).findOne({
-      _id: new (await import("mongodb")).ObjectId(decoded.sub),
-    });
+    const user = await getDB()
+      .collection(USERS_COLLECTION)
+      .findOne(
+        { _id: new ObjectId(req.user.id) },
+        {
+          projection: {
+            name: 1,
+            email: 1,
+            role: 1,
+            createdAt: 1,
+          },
+        },
+      );
 
     if (!user) {
       return res.status(401).json({

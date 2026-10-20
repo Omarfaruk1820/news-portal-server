@@ -1,6 +1,8 @@
 import express from "express";
 import { ObjectId } from "mongodb";
+
 import { getDB } from "../config/db.js";
+import { resolveCategoryName } from "../config/categories.js";
 
 const router = express.Router();
 
@@ -22,30 +24,34 @@ const PUBLIC_NEWS_PROJECTION = {
 };
 
 const ARTICLE_PROJECTION = {
-  title: 1,
-  slug: 1,
-  category: 1,
-  excerpt: 1,
+  ...PUBLIC_NEWS_PROJECTION,
   content: 1,
-  image: 1,
-  author: 1,
-  tags: 1,
   sourceUrl: 1,
-  publishedAt: 1,
-  createdAt: 1,
   updatedAt: 1,
-  featured: 1,
 };
 
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-const parsePagination = (query, defaultLimit = DEFAULT_LIMIT) => {
-  const page = Number(query.page ?? 1);
-  const limit = Number(query.limit ?? defaultLimit);
+function parsePagination(query, defaultLimit = DEFAULT_LIMIT) {
+  const rawPage = query.page ?? "1";
+  const rawLimit = query.limit ?? String(defaultLimit);
+
+  if (
+    typeof rawPage !== "string" ||
+    typeof rawLimit !== "string" ||
+    !/^\d+$/.test(rawPage) ||
+    !/^\d+$/.test(rawLimit)
+  ) {
+    return null;
+  }
+
+  const page = Number(rawPage);
+  const limit = Number(rawLimit);
 
   if (
     !Number.isSafeInteger(page) ||
     page < 1 ||
+    page > 1000000 ||
     !Number.isSafeInteger(limit) ||
     limit < 1 ||
     limit > MAX_LIMIT
@@ -60,7 +66,7 @@ const parsePagination = (query, defaultLimit = DEFAULT_LIMIT) => {
   }
 
   return { page, limit, skip };
-};
+}
 
 const publishedFilter = () => ({
   status: "published",
@@ -68,7 +74,7 @@ const publishedFilter = () => ({
 
 const getNewsCollection = () => getDB().collection(NEWS_COLLECTION);
 
-const sendPaginatedNews = (res, { page, limit, total, news }) => {
+function sendPaginatedNews(res, { page, limit, total, news }) {
   return res.status(200).json({
     success: true,
     pagination: {
@@ -81,10 +87,9 @@ const sendPaginatedNews = (res, { page, limit, total, news }) => {
     },
     data: news,
   });
-};
+}
 
 // GET /api/news
-// All published news; optional category filter and pagination.
 router.get("/", async (req, res, next) => {
   try {
     const pagination = parsePagination(req.query);
@@ -92,7 +97,7 @@ router.get("/", async (req, res, next) => {
     if (!pagination) {
       return res.status(400).json({
         success: false,
-        message: `Page must be positive. Limit must be between 1 and ${MAX_LIMIT}.`,
+        message: `Page must be between 1 and 1000000; limit must be between 1 and ${MAX_LIMIT}.`,
       });
     }
 
@@ -106,9 +111,9 @@ router.get("/", async (req, res, next) => {
         });
       }
 
-      const category = req.query.category.trim();
+      const category = resolveCategoryName(req.query.category);
 
-      if (!category || category.length > 80) {
+      if (!category) {
         return res.status(400).json({
           success: false,
           message: "A valid category is required.",
@@ -116,7 +121,7 @@ router.get("/", async (req, res, next) => {
       }
 
       filter.category = {
-        $regex: `^${escapeRegex(category)}$`,
+        $regex: `^\\s*${escapeRegex(category)}\\s*$`,
         $options: "i",
       };
     }
@@ -132,22 +137,16 @@ router.get("/", async (req, res, next) => {
         .skip(skip)
         .limit(limit)
         .toArray(),
-
       collection.countDocuments(filter),
     ]);
 
-    return sendPaginatedNews(res, {
-      page,
-      limit,
-      total,
-      news,
-    });
+    return sendPaginatedNews(res, { page, limit, total, news });
   } catch (error) {
     return next(error);
   }
 });
 
-// GET /api/news/latest?limit=10
+// GET /api/news/latest
 router.get("/latest", async (req, res, next) => {
   try {
     const pagination = parsePagination({ limit: req.query.limit }, 10);
@@ -176,7 +175,7 @@ router.get("/latest", async (req, res, next) => {
   }
 });
 
-// GET /api/news/featured?limit=5
+// GET /api/news/featured
 router.get("/featured", async (req, res, next) => {
   try {
     const pagination = parsePagination({ limit: req.query.limit }, 5);
@@ -208,8 +207,7 @@ router.get("/featured", async (req, res, next) => {
   }
 });
 
-// GET /api/news/popular?limit=10
-// Popularity is based on the stored views count.
+// GET /api/news/popular
 router.get("/popular", async (req, res, next) => {
   try {
     const pagination = parsePagination({ limit: req.query.limit }, 10);
@@ -238,9 +236,7 @@ router.get("/popular", async (req, res, next) => {
   }
 });
 
-// GET /api/news/trending?limit=10
-// Trending is based on a stored trendingScore.
-// Your publishing/admin workflow must maintain this score.
+// GET /api/news/trending
 router.get("/trending", async (req, res, next) => {
   try {
     const pagination = parsePagination({ limit: req.query.limit }, 10);
@@ -269,7 +265,7 @@ router.get("/trending", async (req, res, next) => {
   }
 });
 
-// GET /api/news/search?q=technology&page=1&limit=10
+// GET /api/news/search?q=technology
 router.get("/search", async (req, res, next) => {
   try {
     const searchTerm =
@@ -287,7 +283,7 @@ router.get("/search", async (req, res, next) => {
     if (!pagination) {
       return res.status(400).json({
         success: false,
-        message: `Page must be positive. Limit must be between 1 and ${MAX_LIMIT}.`,
+        message: "Invalid pagination parameters.",
       });
     }
 
@@ -317,24 +313,17 @@ router.get("/search", async (req, res, next) => {
         .skip(skip)
         .limit(limit)
         .toArray(),
-
       collection.countDocuments(filter),
     ]);
 
-    return sendPaginatedNews(res, {
-      page,
-      limit,
-      total,
-      news,
-    });
+    return sendPaginatedNews(res, { page, limit, total, news });
   } catch (error) {
     return next(error);
   }
 });
 
 // GET /api/news/:identifier
-// A single published article by slug or ObjectId.
-// Keep this route after named routes such as /latest and /search.
+// Keep this route after all named routes above.
 router.get("/:identifier", async (req, res, next) => {
   try {
     const identifier = req.params.identifier.trim();
@@ -357,11 +346,11 @@ router.get("/:identifier", async (req, res, next) => {
       filter.slug = identifier;
     }
 
-    const news = await getNewsCollection().findOne(filter, {
+    const article = await getNewsCollection().findOne(filter, {
       projection: ARTICLE_PROJECTION,
     });
 
-    if (!news) {
+    if (!article) {
       return res.status(404).json({
         success: false,
         message: "News article not found.",
@@ -371,8 +360,8 @@ router.get("/:identifier", async (req, res, next) => {
     return res.status(200).json({
       success: true,
       data: {
-        ...news,
-        publishedAt: news.publishedAt || news.createdAt || null,
+        ...article,
+        publishedAt: article.publishedAt || article.createdAt || null,
       },
     });
   } catch (error) {

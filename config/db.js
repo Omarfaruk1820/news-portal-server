@@ -5,33 +5,37 @@ import { MongoClient } from "mongodb";
 // 1. MongoDB configuration
 // --------------------------------------------------
 
-// Atlas cluster hostname: এখানে শুধু hostname লিখবেন।
-// আপনার Atlas cluster-এর hostname আলাদা হলে সেটি বসান।
-const clusterHost = "cluster0.g29mryf.mongodb.net";
+const CLUSTER_HOST = "cluster0.g29mryf.mongodb.net";
+const DATABASE_NAME = process.env.DB_NAME?.trim();
+const DB_USER = process.env.DB_USER?.trim();
+const DB_PASS = process.env.DB_PASS;
 
-const dbUser = process.env.DB_USER?.trim();
-const dbPass = process.env.DB_PASS;
-const databaseName = process.env.DB_NAME?.trim();
-
-if (!dbUser || !dbPass || !databaseName) {
+if (!DATABASE_NAME || !DB_USER || !DB_PASS) {
   throw new Error(
-    "DB_USER, DB_PASS, and DB_NAME must be configured in the backend .env file.",
+    "MongoDB configuration error: DB_NAME, DB_USER, and DB_PASS must be set in the backend .env file.",
   );
 }
 
-const mongoUri =
-  `mongodb+srv://${encodeURIComponent(dbUser)}:` +
-  `${encodeURIComponent(dbPass)}@${clusterHost}/` +
-  `?retryWrites=true&w=majority`;
+// Keep the cluster hostname and MongoDB URI inside this file.
+// Encode credentials to support special characters in username/password.
+const MONGODB_CLUSTER_HOST = CLUSTER_HOST;
+
+const MONGODB_URI =
+  `mongodb+srv://${encodeURIComponent(DB_USER)}:` +
+  `${encodeURIComponent(DB_PASS)}@${MONGODB_CLUSTER_HOST}/` +
+  `?retryWrites=true&w=majority&appName=NewsPortal`;
 
 // --------------------------------------------------
 // 2. MongoDB client
 // --------------------------------------------------
 
-const client = new MongoClient(mongoUri, {
+const client = new MongoClient(MONGODB_URI, {
   connectTimeoutMS: 10000,
   serverSelectionTimeoutMS: 10000,
   maxPoolSize: 20,
+  minPoolSize: 0,
+  retryReads: true,
+  retryWrites: true,
 });
 
 let database = null;
@@ -39,7 +43,7 @@ let connectionPromise = null;
 let isClosing = false;
 
 // --------------------------------------------------
-// 3. Connect and reuse the database
+// 3. Connect to MongoDB
 // --------------------------------------------------
 
 export async function connectToMongoDB() {
@@ -51,7 +55,7 @@ export async function connectToMongoDB() {
     return database;
   }
 
-  // Prevent simultaneous duplicate connection attempts.
+  // Reuse an ongoing connection attempt.
   if (connectionPromise) {
     return connectionPromise;
   }
@@ -60,18 +64,26 @@ export async function connectToMongoDB() {
     try {
       await client.connect();
 
-      const db = client.db(databaseName);
+      const db = client.db(DATABASE_NAME);
 
-      // Confirm that the database connection is working.
+      // Verify that MongoDB responds.
       await db.command({ ping: 1 });
 
       database = db;
 
-      console.log(`MongoDB connected. Database: ${databaseName}`);
+      console.log(`MongoDB connected. Database: ${DATABASE_NAME}`);
 
       return database;
     } catch (error) {
       console.error("MongoDB connection failed:", error.message);
+
+      // Close a partially established client before retrying.
+      try {
+        await client.close();
+      } catch {
+        // Preserve the original connection error.
+      }
+
       throw error;
     } finally {
       connectionPromise = null;
@@ -107,12 +119,12 @@ export async function disconnectFromMongoDB() {
   isClosing = true;
 
   try {
-    // Wait for an in-progress connection attempt to finish.
+    // Wait for any active connection attempt.
     if (connectionPromise) {
       try {
         await connectionPromise;
       } catch {
-        // The connection error was already logged.
+        // The connection failure was already logged.
       }
     }
 
@@ -120,6 +132,9 @@ export async function disconnectFromMongoDB() {
     database = null;
 
     console.log("MongoDB connection closed.");
+  } catch (error) {
+    console.error("MongoDB shutdown error:", error.message);
+    throw error;
   } finally {
     database = null;
     connectionPromise = null;
